@@ -177,7 +177,7 @@ def train(rank, world_size, graph, num_classes, split_idx):
 
 
 if __name__ == '__main__':
-    dataset = DglNodePropPredDataset('ogbn-products', root='~/dgl/examples/pytorch/graphsage/dataset')
+    dataset = DglNodePropPredDataset('ogbn-products', root='~/.dgl')
     graph, labels = dataset[0]
     graph.ndata['label'] = labels
     graph.create_formats_()  # must be called before mp.spawn().
