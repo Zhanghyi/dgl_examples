@@ -13,6 +13,8 @@ import numpy as np
 from ogb.nodeproppred import DglNodePropPredDataset
 import tqdm
 
+gpus = [2, 3]
+
 
 class SAGE(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes):
@@ -65,16 +67,16 @@ class SAGE(nn.Module):
         g.ndata['h'] = g.ndata['feat']
         sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1, prefetch_node_feats=['h'])
         dataloader = dgl.dataloading.DataLoader(
-                g, torch.arange(g.num_nodes(), device=device), sampler, device=device,
-                batch_size=batch_size, shuffle=False, drop_last=False,
-                num_workers=0, use_ddp=True, use_uva=True)
+            g, torch.arange(g.num_nodes(), device=device), sampler, device=device,
+            batch_size=batch_size, shuffle=False, drop_last=False,
+            num_workers=0, use_ddp=True, use_uva=True)
 
         for l, layer in enumerate(self.layers):
             # in order to prevent running out of GPU memory, we allocate a
             # shared output tensor 'y' in host memory, pin it to allow UVA
             # access from each GPU during forward propagation.
             y = shared_tensor(
-                    (g.num_nodes(), self.n_hidden if l != len(self.layers) - 1 else self.n_classes))
+                (g.num_nodes(), self.n_hidden if l != len(self.layers) - 1 else self.n_classes))
             pin_memory_inplace(y)
 
             for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader) \
@@ -97,11 +99,12 @@ class SAGE(nn.Module):
 
 
 def train(rank, world_size, graph, num_classes, split_idx):
-    torch.cuda.set_device(rank)
+    device_id = gpus[rank]
+    torch.cuda.set_device(device_id)
     dist.init_process_group('nccl', 'tcp://127.0.0.1:12347', world_size=world_size, rank=rank)
 
     model = SAGE(graph.ndata['feat'].shape[1], 256, num_classes).cuda()
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[rank], output_device=rank)
+    model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id], output_device=device_id)
     opt = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
 
     train_idx, valid_idx, test_idx = split_idx['train'], split_idx['valid'], split_idx['test']
@@ -116,15 +119,15 @@ def train(rank, world_size, graph, num_classes, split_idx):
     # the only communication neccessary in training to be the all-reduce for
     # the gradients performed by the DDP wrapper (created above).
     sampler = dgl.dataloading.NeighborSampler(
-            [15, 10, 5], prefetch_node_feats=['feat'], prefetch_labels=['label'])
+        [15, 10, 5], prefetch_node_feats=['feat'], prefetch_labels=['label'])
     train_dataloader = dgl.dataloading.DataLoader(
-            graph, train_idx, sampler,
-            device='cuda', batch_size=1024, shuffle=True, drop_last=False,
-            num_workers=0, use_ddp=True, use_uva=True)
+        graph, train_idx, sampler,
+        device='cuda', batch_size=1024, shuffle=True, drop_last=False,
+        num_workers=0, use_ddp=True, use_uva=True)
     valid_dataloader = dgl.dataloading.DataLoader(
-            graph, valid_idx, sampler, device='cuda', batch_size=1024, shuffle=True,
-            drop_last=False, num_workers=0, use_ddp=True,
-            use_uva=True)
+        graph, valid_idx, sampler, device='cuda', batch_size=1024, shuffle=True,
+        drop_last=False, num_workers=0, use_ddp=True,
+        use_uva=True)
 
     durations = []
     for _ in range(10):
@@ -167,22 +170,24 @@ def train(rank, world_size, graph, num_classes, split_idx):
     model.eval()
     with torch.no_grad():
         # since we do 1-layer at a time, use a very large batch size
-        pred = model.module.inference(graph, device='cuda', batch_size=2**16)
+        pred = model.module.inference(graph, device='cuda', batch_size=2 ** 16)
         if rank == 0:
             acc = MF.accuracy(pred[test_idx], graph.ndata['label'][test_idx])
             print('Test acc:', acc.item())
+
 
 if __name__ == '__main__':
     dataset = DglNodePropPredDataset('ogbn-products')
     graph, labels = dataset[0]
     graph.ndata['label'] = labels
-    graph.create_formats_()     # must be called before mp.spawn().
+    graph.create_formats_()  # must be called before mp.spawn().
     split_idx = dataset.get_idx_split()
     num_classes = dataset.num_classes
     # use all available GPUs
-    n_procs = torch.cuda.device_count()
+    n_procs = len(gpus)
 
     # Tested with mp.spawn and fork.  Both worked and got 4s per epoch with 4 GPUs
     # and 3.86s per epoch with 8 GPUs on p2.8x, compared to 5.2s from official examples.
     import torch.multiprocessing as mp
+
     mp.spawn(train, args=(n_procs, graph, num_classes, split_idx), nprocs=n_procs)
